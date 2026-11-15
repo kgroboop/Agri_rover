@@ -44,10 +44,19 @@ Smallholder farms frequently lose time, water, and crop yield due to delayed dis
 * **PSRAM:** `OPI PSRAM` (Enabled)
 * **Partition Scheme:** `Huge APP (3MB No OTA/1MB SPIFFS)`
 * **Libraries Required:** `esp_camera`, `ESP32Servo`, `DHT sensor library`
-* Flash `brain_s3.ino` to the **ESP32-S3 CAM** and `driver_node.ino` to the **ESP32 Driver Node** (ensure the Driver Node's MAC address is updated in `brain_s3.ino`).
+* Flash `brain_code.ino` to the **ESP32-S3 Cam** and `driver_code.ino` to the **Xiao ESP32S3** (ensure the Driver Node's MAC address is updated in `brain_s3.ino`).
 
 ### 2. Mobile Web Dashboard (`dashboard/`)
-Install Python dependencies and launch the local telemetry server:
+Install Python dependencies and launch the local telemetry server into **Termux**:
 ```bash
 pip install flask
-python dashboard/app.py
+install python
+nano app.py
+"Paste 'dashboard_code'"
+"Press 'ctrl+o' ,then 'enter' and then 'ctrl+x'"
+"Connect to local server"
+python app.py
+
+"Go to printed IP address to access data"
+
+
