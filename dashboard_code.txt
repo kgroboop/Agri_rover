@@ -1,0 +1,133 @@
+from datetime import datetime
+from flask import Flask, jsonify, render_template_string, request
+
+app = Flask(__name__)
+
+mission_logs = []
+cycle_counter = 0
+
+HTML_PAGE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agri-Rover Mission Log</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #161817; color: #e5e5e5; padding: 16px; display: flex; justify-content: center; }
+        .wrapper { width: 100%; max-width: 460px; background-color: #1e201f; border-radius: 16px; padding: 20px 16px; border: 1px solid #2c2f2d; }
+        .header { text-align: center; margin-bottom: 20px; }
+        .header h1 { color: #10d466; font-size: 1.45rem; font-weight: 700; }
+        .header p { color: #8b918e; font-size: 0.85rem; margin-top: 4px; }
+        .cycle-card { background-color: #252826; border: 1px solid #323634; border-radius: 12px; padding: 14px; margin-bottom: 16px; }
+        .cycle-title { color: #10d466; font-size: 0.85rem; font-weight: 700; margin-bottom: 10px; }
+        .photo-box { width: 100%; background-color: #0d0e0e; border: 1px solid #383c3a; border-radius: 8px; overflow: hidden; margin-bottom: 12px; min-height: 180px; display: flex; align-items: center; justify-content: center; }
+        .photo-box img { width: 100%; height: auto; display: block; object-fit: cover; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .metric-box { background-color: #1b1d1c; border: 1px solid #2e3230; border-radius: 8px; padding: 12px 8px; text-align: center; }
+        .metric-label { color: #8f9692; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 6px; }
+        .metric-value { color: #ffffff; font-size: 1.05rem; font-weight: 700; }
+        .badge { display: inline-block; padding: 3px 12px; border-radius: 5px; font-size: 0.8rem; font-weight: 800; }
+        .badge-on { background-color: #10d466; color: #0b1c12; }
+        .badge-off { background-color: #ef4444; color: #ffffff; }
+        .empty-state { text-align: center; color: #777; padding: 40px 10px; font-size: 0.9rem; }
+    </style>
+</head>
+<body>
+    <div class="wrapper">
+        <div class="header">
+            <h1>🌱 Agri-Rover Mission Log</h1>
+            <p>Event-Driven Mission Dashboard</p>
+        </div>
+        <div id="logContainer">
+            <div class="empty-state">Waiting for Rover Sampling Event...</div>
+        </div>
+    </div>
+
+    <script>
+        async function fetchLogs() {
+            try {
+                const res = await fetch('/api/logs');
+                const logs = await res.json();
+                const container = document.getElementById('logContainer');
+                
+                if (logs.length === 0) {
+                    container.innerHTML = '<div class="empty-state">Waiting for rover cycle...</div>';
+                    return;
+                }
+
+                container.innerHTML = logs.map(item => `
+                    <div class="cycle-card">
+                        <div class="cycle-title">Cycle #${item.cycle} — Timestamp: ${item.timestamp}</div>
+                        <div class="photo-box">
+                            <img src="${item.image}" alt="Rover Sample Snapshot">
+                        </div>
+                        <div class="grid">
+                            <div class="metric-box">
+                                <div class="metric-label">SOIL</div>
+                                <div class="metric-value">${item.soil}%</div>
+                            </div>
+                            <div class="metric-box">
+                                <div class="metric-label">TEMP</div>
+                                <div class="metric-value">${item.temp} °C</div>
+                            </div>
+                            <div class="metric-box">
+                                <div class="metric-label">HUMIDITY</div>
+                                <div class="metric-value">${item.humidity} %</div>
+                            </div>
+                            <div class="metric-box">
+                                <div class="metric-label">PUMP</div>
+                                <div class="metric-value">
+                                    <span class="badge ${item.pumpState ? 'badge-on' : 'badge-off'}">
+                                        ${item.pumpState ? 'ON' : 'OFF'}
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (err) {
+                console.error("Error fetching logs:", err);
+            }
+        }
+
+        fetchLogs();
+        setInterval(fetchLogs, 3000); // Only refreshes UI view, doesn't force backend logs
+    </script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_PAGE)
+
+@app.route("/api/logs")
+def get_logs():
+    return jsonify(mission_logs)
+
+# Endpoint where the Brain node pushes data ONLY when it completes a sample cycle
+@app.route("/api/update", methods=["POST"])
+def receive_update():
+    global cycle_counter, mission_logs
+    data = request.json
+    if data:
+        cycle_counter += 1
+        entry = {
+            "cycle": cycle_counter,
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "soil": int(data.get("soil", 0)),
+            "temp": round(float(data.get("temp", 0.0)), 1),
+            "humidity": round(float(data.get("humidity", 0.0)), 1),
+            "pumpState": bool(data.get("pumpState", False)),
+            "image": data.get("image", "")  # Base64 snapshot sent directly from Brain node
+        }
+        mission_logs.insert(0, entry)
+        if len(mission_logs) > 30:
+            mission_logs.pop()
+        return jsonify({"status": "success"}), 200
+    return jsonify({"status": "error"}), 400
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
