@@ -102,6 +102,4 @@ cd <your-repository-folder>
 
 ---
 
-## Team & Attribution
 
-Built for **Kreativity League STEMpreneur** by the **Agri-Rover** team (**Learners International School**). Please replace `<your-repository-url>` and `<your-repository-folder>` with your actual GitHub repository details.
