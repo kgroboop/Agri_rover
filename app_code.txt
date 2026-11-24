@@ -1,0 +1,474 @@
+package com.agrirover.dashboard
+
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color
+import android.os.Bundle
+import android.util.Base64
+import android.view.WindowManager
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.appcompat.app.AppCompatActivity
+import fi.iki.elonen.NanoHTTPD
+import org.json.JSONArray
+import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.*
+import java.util.concurrent.Executors
+import kotlin.math.max
+import kotlin.math.min
+
+class MainActivity : AppCompatActivity() {
+
+    private var server: RoverServer? = null
+    private lateinit var webView: WebView
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        webView = WebView(this)
+        webView.settings.javaScriptEnabled = true
+        webView.settings.domStorageEnabled = true
+        webView.webViewClient = WebViewClient()
+        setContentView(webView)
+
+        try {
+            server = RoverServer(5000)
+            server?.start()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        webView.loadUrl("http://127.0.0.1:5000/")
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        server?.stop()
+    }
+
+    class RoverServer(port: Int) : NanoHTTPD(port) {
+        private val missionLogs = JSONArray()
+        private var cycleCounter = 0
+        private val aiExecutor = Executors.newSingleThreadExecutor()
+
+        override fun serve(session: IHTTPSession): Response {
+            val uri = session.uri
+            val method = session.method
+
+            // 1. Existing ESP32-S3 Brain Node endpoint
+            if (method == Method.POST && uri == "/api/update") {
+                return try {
+                    val files = HashMap<String, String>()
+                    session.parseBody(files)
+                    val postData = files["postData"] ?: "{}"
+                    val json = JSONObject(postData)
+
+                    cycleCounter++
+                    val timeStr = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+
+                    val entry = JSONObject().apply {
+                        put("cycle", cycleCounter)
+                        put("timestamp", timeStr)
+                        put("soil", json.optInt("soil", 0))
+                        put("temp", json.optDouble("temp", 0.0))
+                        put("humidity", json.optDouble("humidity", 0.0))
+                        put("pumpState", json.optBoolean("pumpState", false))
+                        put("image", json.optString("image", ""))
+                        put("aiStatus", "UNANALYZED")
+                        put("aiDiagnosis", "Tap 'Classify Cycle' for instant offline check.")
+                    }
+
+                    synchronized(missionLogs) {
+                        val updatedLogs = JSONArray()
+                        updatedLogs.put(entry)
+                        for (i in 0 until minOf(missionLogs.length(), 29)) {
+                            updatedLogs.put(missionLogs.getJSONObject(i))
+                        }
+                        while (missionLogs.length() > 0) missionLogs.remove(0)
+                        for (i in 0 until updatedLogs.length()) {
+                            missionLogs.put(updatedLogs.getJSONObject(i))
+                        }
+                    }
+
+                    newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\":\"success\"}")
+                } catch (e: Exception) {
+                    newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\":\"error\"}")
+                }
+            }
+
+            // 2. Dashboard UI polling endpoint
+            if (method == Method.GET && uri == "/api/logs") {
+                val snapshot = synchronized(missionLogs) { missionLogs.toString() }
+                return newFixedLengthResponse(Response.Status.OK, "application/json", snapshot)
+            }
+
+            // 3. Per-cycle offline analysis endpoint
+            if (method == Method.POST && uri == "/api/analyze") {
+                return try {
+                    val files = HashMap<String, String>()
+                    session.parseBody(files)
+                    val postData = files["postData"] ?: "{}"
+                    val reqJson = JSONObject(postData)
+                    val targetCycle = reqJson.optInt("cycle", -1)
+                    val sensitivity = reqJson.optString("sensitivity", "medium")
+
+                    var targetObj: JSONObject? = null
+                    synchronized(missionLogs) {
+                        for (i in 0 until missionLogs.length()) {
+                            val item = missionLogs.getJSONObject(i)
+                            if (targetCycle == -1 || item.optInt("cycle", -1) == targetCycle) {
+                                targetObj = item
+                                break
+                            }
+                        }
+                    }
+
+                    if (targetObj == null) {
+                        newFixedLengthResponse(
+                            Response.Status.NOT_FOUND,
+                            "application/json",
+                            "{\"ok\":false,\"error\":\"Log entry not found.\"}"
+                        )
+                    } else {
+                        val logEntry = targetObj!!
+                        val imageField = reqJson.optString("image", logEntry.optString("image", ""))
+
+                        if (imageField.isBlank()) {
+                            logEntry.put("aiStatus", "NOT A PLANT")
+                            logEntry.put("aiDiagnosis", "NOT A PLANT\nNo snapshot image available in this cycle.")
+                            newFixedLengthResponse(Response.Status.OK, "application/json", logEntry.toString())
+                        } else {
+                            val result = classifyLeafSimple(imageField, logEntry, sensitivity)
+                            logEntry.put("aiStatus", result.first)
+                            logEntry.put("aiDiagnosis", result.second)
+                            newFixedLengthResponse(Response.Status.OK, "application/json", logEntry.toString())
+                        }
+                    }
+                } catch (e: Exception) {
+                    val errJson = JSONObject().apply {
+                        put("ok", false)
+                        put("error", e.message ?: "Analysis failed")
+                    }
+                    newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json", errJson.toString())
+                }
+            }
+
+            // 4. Dashboard HTML UI
+            return newFixedLengthResponse(Response.Status.OK, "text/html", DASHBOARD_HTML)
+        }
+
+        private fun classifyLeafSimple(
+            imageData: String,
+            telemetry: JSONObject,
+            sensitivity: String
+        ): Pair<String, String> {
+            val future = aiExecutor.submit<Pair<String, String>> {
+                val soil = telemetry.optInt("soil", 0)
+                val temp = telemetry.optDouble("temp", 0.0)
+                val humidity = telemetry.optDouble("humidity", 0.0)
+                val pumpOn = telemetry.optBoolean("pumpState", false)
+                val teleSummary = "Soil $soil%, Temp ${String.format(Locale.US, "%.1f", temp)}°C, Humidity ${String.format(Locale.US, "%.1f", humidity)}%, Pump ${if (pumpOn) "ON" else "OFF"}."
+
+                try {
+                    val cleanBase64 = if (imageData.contains(",")) {
+                        imageData.substringAfter(",").trim()
+                    } else {
+                        imageData.trim()
+                    }
+
+                    val bytes = Base64.decode(cleanBase64, Base64.DEFAULT)
+                    val decoded: Bitmap? = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    if (decoded == null) {
+                        return@submit Pair(
+                            "NOT A PLANT",
+                            "NOT A PLANT\nImage could not be decoded; defaulting to NOT A PLANT.\n$teleSummary"
+                        )
+                    }
+
+                    val w = 120
+                    val h = 120
+                    val scaled = Bitmap.createScaledBitmap(decoded, w, h, true)
+                    if (scaled != decoded) decoded.recycle()
+
+                    val xStart = (w * 0.20).toInt()
+                    val xEnd = (w * 0.80).toInt()
+                    val yStart = (h * 0.20).toInt()
+                    val yEnd = (h * 0.80).toInt()
+
+                    var validPixels = 0
+                    var greenPixels = 0
+                    var lesionPixels = 0
+
+                    val hsv = FloatArray(3)
+                    for (y in yStart until yEnd) {
+                        for (x in xStart until xEnd) {
+                            val px = scaled.getPixel(x, y)
+                            val r = Color.red(px)
+                            val g = Color.green(px)
+                            val b = Color.blue(px)
+
+                            val maxC = max(r, max(g, b))
+                            val minC = min(r, min(g, b))
+                            if (maxC < 25 || (maxC > 245 && (maxC - minC) < 15)) continue
+
+                            validPixels++
+                            Color.RGBToHSV(r, g, b, hsv)
+                            val hue = hsv[0]
+                            val sat = hsv[1]
+                            val valB = hsv[2]
+
+                            // Green leaf tone
+                            val isGreen = (hue in 68f..165f) && (sat >= 0.20f) && (valB >= 0.16f) && (g >= r + 6)
+                            // Yellowing or brown/spotted leaf lesion tone
+                            val isLesion = ((hue in 35f..67f) && sat >= 0.30f && valB >= 0.22f) ||
+                                    ((hue in 5f..34f) && sat >= 0.30f && valB in 0.14f..0.75f && r >= g + 5)
+
+                            if (isGreen) greenPixels++
+                            if (isLesion) lesionPixels++
+                        }
+                    }
+                    scaled.recycle()
+
+                    val greenRatio = if (validPixels > 0) greenPixels.toFloat() / validPixels.toFloat() else 0f
+                    val vegTotal = greenPixels + lesionPixels
+                    val lesionShare = if (vegTotal > 0) lesionPixels.toFloat() / vegTotal.toFloat() else 0f
+
+                    // Anything without clear plant presence is NOT A PLANT
+                    if (validPixels == 0 || greenPixels < 60 || greenRatio < 0.10f) {
+                        return@submit Pair(
+                            "NOT A PLANT",
+                            "NOT A PLANT\nNo clear plant foliage detected in center frame (${String.format(Locale.US, "%.0f", greenRatio * 100)}% green).\n$teleSummary"
+                        )
+                    }
+
+                    val lesionCutoff = when (sensitivity.lowercase(Locale.getDefault())) {
+                        "low" -> 0.20f
+                        "high" -> 0.05f
+                        else -> 0.12f
+                    }
+
+                    val label = if (lesionShare >= lesionCutoff) "DISEASED" else "HEALTHY"
+                    val line1 = if (label == "DISEASED") {
+                        "Leaf discoloration/spots detected (${String.format(Locale.US, "%.0f", lesionShare * 100)}% lesion share, ${String.format(Locale.US, "%.0f", greenRatio * 100)}% green)."
+                    } else {
+                        "Healthy green leaf appearance (${String.format(Locale.US, "%.0f", greenRatio * 100)}% green, ${String.format(Locale.US, "%.0f", lesionShare * 100)}% lesion share)."
+                    }
+                    val line2 = if (label == "DISEASED") {
+                        "Inspect affected leaves and check moisture; $teleSummary"
+                    } else {
+                        "Foliage looks normal; $teleSummary"
+                    }
+
+                    Pair(label, "$label\n$line1\n$line2")
+                } catch (e: Exception) {
+                    Pair(
+                        "NOT A PLANT",
+                        "NOT A PLANT\nCould not process snapshot (${e.javaClass.simpleName}); defaulting to NOT A PLANT.\n$teleSummary"
+                    )
+                }
+            }
+
+            return future.get()
+        }
+
+        companion object {
+            val DASHBOARD_HTML = """
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Agri-Rover App</title>
+                    <style>
+                        * { box-sizing: border-box; margin: 0; padding: 0; }
+                        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #161817; color: #e5e5e5; padding: 16px; display: flex; justify-content: center; }
+                        .wrapper { width: 100%; max-width: 460px; background-color: #1e201f; border-radius: 16px; padding: 20px 16px; border: 1px solid #2c2f2d; }
+                        .header { text-align: center; margin-bottom: 14px; }
+                        .header h1 { color: #10d466; font-size: 1.45rem; font-weight: 700; }
+                        .header p { color: #8b918e; font-size: 0.85rem; margin-top: 4px; }
+                        .sensitivity-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; background-color: #252826; border: 1px solid #323634; border-radius: 8px; padding: 8px 12px; margin-bottom: 12px; font-size: 0.8rem; }
+                        .sensitivity-bar select { background-color: #161817; color: #10d466; border: 1px solid #10d466; border-radius: 6px; padding: 5px 8px; font-weight: 700; }
+                        .batch-bar { margin-bottom: 14px; }
+                        .batch-btn { width: 100%; background-color: #252826; color: #10d466; border: 1px solid #10d466; border-radius: 8px; padding: 10px 12px; font-size: 0.86rem; font-weight: 800; cursor: pointer; }
+                        .batch-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+                        .cycle-card { background-color: #252826; border: 1px solid #323634; border-radius: 12px; padding: 14px; margin-bottom: 16px; }
+                        .cycle-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 10px; }
+                        .cycle-title { color: #10d466; font-size: 0.85rem; font-weight: 700; }
+                        .ai-tag { display: inline-block; padding: 4px 10px; border-radius: 6px; font-size: 0.72rem; font-weight: 800; letter-spacing: 0.5px; background-color: #2e3330; color: #e5e5e5; }
+                        .tag-healthy { background-color: #10d466; color: #0b1c12; }
+                        .tag-diseased { background-color: #ef4444; color: #ffffff; }
+                        .tag-not-plant { background-color: #f59e0b; color: #1a1204; }
+                        .photo-box { width: 100%; background-color: #0d0e0e; border: 1px solid #383c3a; border-radius: 8px; overflow: hidden; margin-bottom: 12px; min-height: 180px; display: flex; align-items: center; justify-content: center; }
+                        .photo-box img { width: 100%; height: auto; display: block; object-fit: cover; }
+                        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+                        .metric-box { background-color: #1b1d1c; border: 1px solid #2e3230; border-radius: 8px; padding: 12px 8px; text-align: center; }
+                        .metric-label { color: #8f9692; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 6px; }
+                        .metric-value { color: #ffffff; font-size: 1.05rem; font-weight: 700; }
+                        .badge { display: inline-block; padding: 3px 12px; border-radius: 5px; font-size: 0.8rem; font-weight: 800; }
+                        .badge-on { background-color: #10d466; color: #0b1c12; }
+                        .badge-off { background-color: #ef4444; color: #ffffff; }
+                        .ai-btn { width: 100%; background-color: #10d466; color: #0b1c12; border: none; border-radius: 8px; padding: 10px 12px; font-size: 0.86rem; font-weight: 800; cursor: pointer; margin-bottom: 8px; }
+                        .ai-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+                        .ai-note { background-color: #161817; border: 1px solid #2e3230; border-radius: 8px; padding: 10px; font-size: 0.82rem; color: #d8e2dc; line-height: 1.45; white-space: pre-wrap; }
+                        .empty-state { text-align: center; color: #777; padding: 40px 10px; font-size: 0.9rem; }
+                    </style>
+                </head>
+                <body>
+                    <div class="wrapper">
+                        <div class="header">
+                            <h1>Agri-Rover Mission Log</h1>
+                            <p>Simple Offline Vision + Telemetry</p>
+                        </div>
+
+                        <div class="sensitivity-bar">
+                            <span>Lesion Sensitivity:</span>
+                            <select id="sensitivitySelect">
+                                <option value="low">Low (Less Diseased)</option>
+                                <option value="medium">Medium (Balanced)</option>
+                                <option value="high" selected>High (More Diseased)</option>
+                            </select>
+                        </div>
+
+                        <div class="batch-bar">
+                            <button id="batchBtn" class="batch-btn" onclick="classifyAllPending()">Classify All Pending Snapshots</button>
+                        </div>
+
+                        <div id="logContainer">
+                            <div class="empty-state">App Ready — Waiting for Rover Sampling Event...</div>
+                        </div>
+                    </div>
+
+                    <script>
+                        var latestLogs = [];
+                        var busyCycles = {};
+                        var batchRunning = false;
+
+                        function getSensitivity() {
+                            var sel = document.getElementById('sensitivitySelect');
+                            return sel ? sel.value : 'medium';
+                        }
+
+                        function badgeClassFor(status) {
+                            if (status === 'HEALTHY') return 'ai-tag tag-healthy';
+                            if (status === 'DISEASED') return 'ai-tag tag-diseased';
+                            if (status === 'NOT A PLANT') return 'ai-tag tag-not-plant';
+                            return 'ai-tag';
+                        }
+
+                        async function classifyCycle(cycleNum) {
+                            var entry = latestLogs.find(function(x) { return x.cycle === cycleNum; });
+                            if (!entry || !entry.image) return;
+
+                            busyCycles[cycleNum] = true;
+                            renderLogs();
+
+                            try {
+                                await fetch('/api/analyze', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                        cycle: cycleNum,
+                                        image: entry.image,
+                                        sensitivity: getSensitivity()
+                                    })
+                                });
+                            } catch (err) {
+                                console.error('Analysis error:', err);
+                            } finally {
+                                delete busyCycles[cycleNum];
+                                await fetchLogs();
+                            }
+                        }
+
+                        async function classifyAllPending() {
+                            if (batchRunning) return;
+                            batchRunning = true;
+                            var batchBtn = document.getElementById('batchBtn');
+                            if (batchBtn) batchBtn.disabled = true;
+
+                            try {
+                                var pending = latestLogs.filter(function(item) {
+                                    return item.image && item.aiStatus === 'UNANALYZED';
+                                });
+                                for (var i = 0; i < pending.length; i++) {
+                                    await classifyCycle(pending[i].cycle);
+                                }
+                            } finally {
+                                batchRunning = false;
+                                if (batchBtn) batchBtn.disabled = false;
+                            }
+                        }
+
+                        function renderLogs() {
+                            var container = document.getElementById('logContainer');
+                            if (!latestLogs || latestLogs.length === 0) {
+                                container.innerHTML = '<div class="empty-state">App Ready — Waiting for Rover Cycle...</div>';
+                                return;
+                            }
+
+                            container.innerHTML = latestLogs.map(function(item) {
+                                var isBusy = !!busyCycles[item.cycle];
+                                var statusText = isBusy ? 'ANALYZING' : (item.aiStatus || 'UNANALYZED');
+                                var noteText = isBusy ? 'Analyzing snapshot locally...' : (item.aiDiagnosis || 'Ready for check.');
+
+                                return '<div class="cycle-card">' +
+                                    '<div class="cycle-top">' +
+                                        '<div class="cycle-title">Cycle #' + item.cycle + ' — ' + item.timestamp + '</div>' +
+                                        '<span class="' + badgeClassFor(statusText) + '">' + statusText + '</span>' +
+                                    '</div>' +
+                                    '<div class="photo-box">' +
+                                        '<img src="' + item.image + '" alt="Rover Sample Snapshot">' +
+                                    '</div>' +
+                                    '<div class="grid">' +
+                                        '<div class="metric-box">' +
+                                            '<div class="metric-label">SOIL</div>' +
+                                            '<div class="metric-value">' + item.soil + '%</div>' +
+                                        '</div>' +
+                                        '<div class="metric-box">' +
+                                            '<div class="metric-label">TEMP</div>' +
+                                            '<div class="metric-value">' + Number(item.temp).toFixed(1) + ' °C</div>' +
+                                        '</div>' +
+                                        '<div class="metric-box">' +
+                                            '<div class="metric-label">HUMIDITY</div>' +
+                                            '<div class="metric-value">' + Number(item.humidity).toFixed(1) + ' %</div>' +
+                                        '</div>' +
+                                        '<div class="metric-box">' +
+                                            '<div class="metric-label">PUMP</div>' +
+                                            '<div class="metric-value">' +
+                                                '<span class="badge ' + (item.pumpState ? 'badge-on' : 'badge-off') + '">' +
+                                                    (item.pumpState ? 'ON' : 'OFF') +
+                                                '</span>' +
+                                            '</div>' +
+                                        '</div>' +
+                                    '</div>' +
+                                    '<button class="ai-btn" ' + (isBusy ? 'disabled' : '') + ' onclick="classifyCycle(' + item.cycle + ')">' +
+                                        (isBusy ? 'Analyzing Cycle #' + item.cycle + '...' : 'Classify Cycle #' + item.cycle) +
+                                    '</button>' +
+                                    '<div class="ai-note">' + noteText + '</div>' +
+                                '</div>';
+                            }).join('');
+                        }
+
+                        async function fetchLogs() {
+                            try {
+                                var res = await fetch('/api/logs');
+                                var logs = await res.json();
+                                latestLogs = logs;
+                                renderLogs();
+                            } catch (err) {
+                                console.error('Error fetching logs:', err);
+                            }
+                        }
+
+                        fetchLogs();
+                        setInterval(fetchLogs, 2000);
+                    </script>
+                </body>
+                </html>
+            """.trimIndent()
+        }
+    }
+}
